@@ -766,21 +766,142 @@ if st.button(
 
 
 # ======================================================
+# DEMONSTRATION SCENARIOS
+# ======================================================
+
+st.header("🎬 Demonstration Scenarios")
+
+st.caption(
+    "Load predefined scenarios to demonstrate "
+    "safe states and deadlocks."
+)
+
+
+# ------------------------------------------------------
+# SAFE SCENARIO
+# ------------------------------------------------------
+
+if st.button(
+    "🟢 Load Safe Scenario",
+    use_container_width=True
+):
+
+    st.session_state.resources = [
+        "CPU",
+        "Memory",
+        "GPU"
+    ]
+
+    st.session_state.processes = [
+        "P0",
+        "P1",
+        "P2",
+        "P3",
+        "P4"
+    ]
+
+    st.session_state.total = [
+        10,
+        7,
+        7
+    ]
+
+    st.session_state.maximum = [
+        [7, 5, 3],
+        [3, 2, 2],
+        [9, 0, 2],
+        [2, 2, 2],
+        [4, 3, 3]
+    ]
+
+    st.session_state.allocation = [
+        [0, 1, 0],
+        [2, 0, 0],
+        [3, 0, 2],
+        [2, 1, 1],
+        [0, 0, 2]
+    ]
+
+    st.success(
+        "Safe scenario loaded."
+    )
+
+    st.rerun()
+
+
+# ------------------------------------------------------
+# DEADLOCK SCENARIO
+# ------------------------------------------------------
+
+if st.button(
+    "🔴 Load Deadlock Scenario",
+    use_container_width=True
+):
+
+    st.session_state.resources = [
+        "CPU",
+        "Memory",
+        "GPU"
+    ]
+
+    st.session_state.processes = [
+        "P0",
+        "P1",
+        "P2"
+    ]
+
+    # Each resource has only one instance.
+    st.session_state.total = [
+        1,
+        1,
+        1
+    ]
+
+    # Maximum requirements.
+    #
+    # P0 needs CPU + Memory
+    # P1 needs Memory + GPU
+    # P2 needs GPU + CPU
+
+    st.session_state.maximum = [
+        [1, 1, 0],
+        [0, 1, 1],
+        [1, 0, 1]
+    ]
+
+    # Current allocation:
+    #
+    # P0 holds CPU
+    # P1 holds Memory
+    # P2 holds GPU
+
+    st.session_state.allocation = [
+        [1, 0, 0],
+        [0, 1, 0],
+        [0, 0, 1]
+    ]
+
+    st.success(
+        "Deadlock scenario loaded."
+    )
+
+    st.rerun()
+
+
+# ======================================================
 # RESET SIMULATION
 # ======================================================
 
 st.header("🔄 Simulation Control")
 
 if st.button(
-    "Reset Simulation",
+    "Reset to Default",
     use_container_width=True
 ):
 
     reset_to_defaults()
 
     st.rerun()
-
-
 # ======================================================
 # FOOTER
 # ======================================================
