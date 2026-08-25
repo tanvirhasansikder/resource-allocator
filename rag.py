@@ -54,9 +54,9 @@ def build_resource_allocation_graph(
             allocated = allocation[i][j]
             maximum_required = maximum[i][j]
 
-            # ------------------------------------------
-            # RESOURCE -> PROCESS
-            # ------------------------------------------
+            # Resource -> Process
+            # Means the process currently holds
+            # the resource.
 
             if allocated > 0:
                 edges.append({
@@ -66,9 +66,9 @@ def build_resource_allocation_graph(
                     "label": f"Allocated: {allocated}"
                 })
 
-            # ------------------------------------------
-            # PROCESS -> RESOURCE
-            # ------------------------------------------
+            # Process -> Resource
+            # Means the process is requesting
+            # the resource.
 
             remaining_need = maximum_required - allocated
 
@@ -175,7 +175,7 @@ def find_cycles(nodes, edges):
 
     Example:
 
-        CPU -> P0 -> Memory -> P1 -> GPU -> P2 -> CPU
+        P0 -> Memory -> P1 -> GPU -> P2 -> CPU -> P0
 
     represents a circular wait.
     """
@@ -188,6 +188,7 @@ def find_cycles(nodes, edges):
 
     # Add directed edges
     for edge in edges:
+
         source = edge["source"]
         target = edge["target"]
 
@@ -195,6 +196,7 @@ def find_cycles(nodes, edges):
             graph[source].append(target)
 
     cycles = []
+
     visited = set()
     recursion_stack = set()
 
@@ -207,25 +209,33 @@ def find_cycles(nodes, edges):
         for neighbor in graph.get(node, []):
 
             if neighbor not in visited:
-                dfs(neighbor, path)
+
+                dfs(
+                    neighbor,
+                    path
+                )
 
             elif neighbor in recursion_stack:
 
                 try:
-                    start_index = path.index(neighbor)
+
+                    start_index = path.index(
+                        neighbor
+                    )
 
                     cycle = (
                         path[start_index:]
                         + [neighbor]
                     )
 
-                    # Avoid duplicate cycles
                     normalized = tuple(cycle)
 
-                    if normalized not in [
+                    existing_cycles = [
                         tuple(existing)
                         for existing in cycles
-                    ]:
+                    ]
+
+                    if normalized not in existing_cycles:
                         cycles.append(cycle)
 
                 except ValueError:
@@ -234,27 +244,95 @@ def find_cycles(nodes, edges):
         path.pop()
         recursion_stack.remove(node)
 
+    # Run DFS
     for node in graph:
 
         if node not in visited:
-            dfs(node, [])
+
+            dfs(
+                node,
+                []
+            )
 
     return cycles
+
+
+# ======================================================
+# DEADLOCK INFORMATION
+# ======================================================
+
+def get_deadlock_information(nodes, edges):
+    """
+    Build detailed deadlock information.
+
+    Includes:
+
+    - Current resource allocations
+    - Current resource requests
+    - Detected cycles
+
+    This gives the LLM enough evidence to explain
+    why the deadlock exists.
+    """
+
+    cycles = find_cycles(
+        nodes,
+        edges
+    )
+
+    allocations = []
+    requests = []
+
+    # --------------------------------------------------
+    # Separate allocation and request edges
+    # --------------------------------------------------
+
+    for edge in edges:
+
+        if edge["type"] == "allocation":
+
+            allocations.append({
+                "resource": edge["source"],
+                "process": edge["target"],
+                "amount": edge["label"]
+            })
+
+        elif edge["type"] == "request":
+
+            requests.append({
+                "process": edge["source"],
+                "resource": edge["target"],
+                "amount": edge["label"]
+            })
+
+    return {
+        "type": "deadlock_analysis",
+        "has_cycle": len(cycles) > 0,
+        "cycles": cycles,
+        "allocations": allocations,
+        "requests": requests
+    }
 
 
 # ======================================================
 # RAG RETRIEVAL
 # ======================================================
 
-def retrieve_graph_context(query, nodes, edges):
+def retrieve_graph_context(
+    query,
+    nodes,
+    edges
+):
     """
     Retrieve relevant information from the Resource
     Allocation Graph based on a natural-language query.
 
-    This is the retrieval component.
+    Deadlock queries return detailed graph evidence,
+    including:
 
-    The retrieved context can later be passed to an
-    LLM for answer generation.
+    - allocations
+    - requests
+    - cycles
     """
 
     query = query.lower()
@@ -319,16 +397,14 @@ def retrieve_graph_context(query, nodes, edges):
         for keyword in deadlock_keywords
     ):
 
-        cycles = find_cycles(
+        deadlock_information = get_deadlock_information(
             nodes,
             edges
         )
 
-        context.append({
-            "type": "deadlock_analysis",
-            "has_cycle": len(cycles) > 0,
-            "cycles": cycles
-        })
+        context.append(
+            deadlock_information
+        )
 
     # ==================================================
     # FALLBACK
@@ -352,7 +428,7 @@ def retrieve_graph_context(query, nodes, edges):
 def format_context(context):
     """
     Convert retrieved graph information into readable
-    text suitable for an eventual LLM prompt.
+    text suitable for an LLM prompt.
     """
 
     output = []
@@ -469,6 +545,10 @@ def format_context(context):
                 "\nDeadlock Analysis:"
             )
 
+            # --------------------------------------------
+            # Cycle
+            # --------------------------------------------
+
             if item["has_cycle"]:
 
                 output.append(
@@ -476,13 +556,13 @@ def format_context(context):
                 )
 
                 output.append(
-                    "Cycle(s):"
+                    "\nDetected Cycle(s):"
                 )
 
                 for cycle in item["cycles"]:
 
                     output.append(
-                        " -> ".join(cycle)
+                        "- " + " -> ".join(cycle)
                     )
 
             else:
@@ -490,6 +570,52 @@ def format_context(context):
                 output.append(
                     "No cycle detected."
                 )
+
+            # --------------------------------------------
+            # Allocations
+            # --------------------------------------------
+
+            output.append(
+                "\nCurrent Resource Allocations:"
+            )
+
+            if item["allocations"]:
+
+                for allocation in item["allocations"]:
+
+                    output.append(
+                        f"- {allocation['resource']} "
+                        f"is allocated to "
+                        f"{allocation['process']} "
+                        f"({allocation['amount']})"
+                    )
+
+            else:
+
+                output.append("- None")
+
+            # --------------------------------------------
+            # Requests
+            # --------------------------------------------
+
+            output.append(
+                "\nCurrent Resource Requests:"
+            )
+
+            if item["requests"]:
+
+                for request in item["requests"]:
+
+                    output.append(
+                        f"- {request['process']} "
+                        f"is requesting "
+                        f"{request['resource']} "
+                        f"({request['amount']})"
+                    )
+
+            else:
+
+                output.append("- None")
 
         # ------------------------------------------------
         # COMPLETE GRAPH
@@ -501,7 +627,9 @@ def format_context(context):
                 "\nComplete Graph:"
             )
 
-            output.append("Nodes:")
+            output.append(
+                "Nodes:"
+            )
 
             for node in item["nodes"]:
 
@@ -510,7 +638,9 @@ def format_context(context):
                     f"({node['type']})"
                 )
 
-            output.append("Edges:")
+            output.append(
+                "Edges:"
+            )
 
             for edge in item["edges"]:
 
@@ -600,7 +730,7 @@ if __name__ == "__main__":
         print(edge)
 
     # ==================================================
-    # TEST PROCESS RETRIEVAL
+    # PROCESS RETRIEVAL TEST
     # ==================================================
 
     print("\n" + "=" * 50)
@@ -609,7 +739,9 @@ if __name__ == "__main__":
 
     query = "Why is P0 waiting?"
 
-    print(f"\nQuery: {query}")
+    print(
+        f"\nQuery: {query}"
+    )
 
     context = retrieve_graph_context(
         query,
@@ -618,12 +750,13 @@ if __name__ == "__main__":
     )
 
     print("\nRetrieved Context:")
+
     print(
         format_context(context)
     )
 
     # ==================================================
-    # TEST DEADLOCK RETRIEVAL
+    # DEADLOCK RETRIEVAL TEST
     # ==================================================
 
     print("\n" + "=" * 50)
@@ -632,7 +765,9 @@ if __name__ == "__main__":
 
     query = "Why is the system deadlocked?"
 
-    print(f"\nQuery: {query}")
+    print(
+        f"\nQuery: {query}"
+    )
 
     context = retrieve_graph_context(
         query,
@@ -641,6 +776,7 @@ if __name__ == "__main__":
     )
 
     print("\nRetrieved Context:")
+
     print(
         format_context(context)
     )
