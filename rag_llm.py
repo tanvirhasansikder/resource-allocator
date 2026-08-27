@@ -1,1175 +1,2107 @@
-
 import torch
+import requests
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 # ============================================================
-# RESOURCE ALLOCATION GRAPH
+# CONFIGURATION
 # ============================================================
 
-def build_resource_allocation_graph(
-    processes,
-    resources,
-    allocation,
-    maximum
-):
-    nodes = []
-    edges = []
+# Kept for compatibility with the existing project.
+# The actual LLM answer generation uses llama-server.
+MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 
-    for process in processes:
-        nodes.append({
-            "id": process,
-            "label": process,
-            "type": "process"
-        })
+# Local llama.cpp server
+LLAMA_SERVER_URL = "http://127.0.0.1:8080"
 
-    for resource in resources:
-        nodes.append({
-            "id": resource,
-            "label": resource,
-            "type": "resource"
-        })
+# These are only used if the Transformers fallback is ever used.
+DEVICE = "cpu"
+
+# Global model cache.
+_TOKENIZER = None
+_MODEL = None
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def calculate_need(maximum, allocation):
+    """
+    Need = Maximum - Allocation
+    """
+
+    need = []
+
+    for i in range(len(maximum)):
+        row = []
+
+        for j in range(len(maximum[i])):
+            row.append(
+                maximum[i][j] - allocation[i][j]
+            )
+
+        need.append(row)
+
+    return need
+
+
+def find_process(question, processes):
+    """
+    Find a process mentioned in the question.
+
+    Examples:
+        P0
+        p1
+        Process P2
+    """
+
+    question_lower = question.lower()
 
     for i, process in enumerate(processes):
 
-        for j, resource in enumerate(resources):
+        if process.lower() in question_lower:
+            return i
 
-            allocated = allocation[i][j]
-            maximum_required = maximum[i][j]
-
-            if allocated > 0:
-
-                edges.append({
-                    "source": resource,
-                    "target": process,
-                    "type": "allocation",
-                    "label": f"Allocated: {allocated}"
-                })
-
-            remaining_need = maximum_required - allocated
-
-            if remaining_need > 0:
-
-                edges.append({
-                    "source": process,
-                    "target": resource,
-                    "type": "request",
-                    "label": f"Need: {remaining_need}"
-                })
-
-    return nodes, edges
+    return None
 
 
-# ============================================================
-# PROCESS INFORMATION
-# ============================================================
+def format_resources(resources, values):
+    """
+    Convert:
 
-def get_process_information(process_id, edges):
+        ["CPU", "Memory", "GPU"]
+        [7, 5, 3]
 
-    information = {
-        "process": process_id,
-        "allocated_resources": [],
-        "requested_resources": []
-    }
+    into:
 
-    for edge in edges:
+        CPU: 7, Memory: 5, GPU: 3
+    """
 
-        if (
-            edge["target"] == process_id
-            and edge["type"] == "allocation"
-        ):
-
-            information["allocated_resources"].append({
-                "resource": edge["source"],
-                "amount": edge["label"]
-            })
-
-        elif (
-            edge["source"] == process_id
-            and edge["type"] == "request"
-        ):
-
-            information["requested_resources"].append({
-                "resource": edge["target"],
-                "amount": edge["label"]
-            })
-
-    return information
-
-
-# ============================================================
-# RESOURCE INFORMATION
-# ============================================================
-
-def get_resource_information(resource_id, edges):
-
-    information = {
-        "resource": resource_id,
-        "allocated_to": [],
-        "requested_by": []
-    }
-
-    for edge in edges:
-
-        if (
-            edge["source"] == resource_id
-            and edge["type"] == "allocation"
-        ):
-
-            information["allocated_to"].append({
-                "process": edge["target"],
-                "amount": edge["label"]
-            })
-
-        elif (
-            edge["target"] == resource_id
-            and edge["type"] == "request"
-        ):
-
-            information["requested_by"].append({
-                "process": edge["source"],
-                "amount": edge["label"]
-            })
-
-    return information
-
-
-# ============================================================
-# CYCLE DETECTION
-# ============================================================
-
-def find_cycles(nodes, edges):
-
-    graph = {}
-
-    for node in nodes:
-        graph[node["id"]] = []
-
-    for edge in edges:
-
-        source = edge["source"]
-        target = edge["target"]
-
-        if source in graph:
-            graph[source].append(target)
-
-    cycles = []
-
-    visited = set()
-    recursion_stack = set()
-
-    def dfs(node, path):
-
-        visited.add(node)
-        recursion_stack.add(node)
-        path.append(node)
-
-        for neighbor in graph.get(node, []):
-
-            if neighbor not in visited:
-
-                dfs(
-                    neighbor,
-                    path
-                )
-
-            elif neighbor in recursion_stack:
-
-                try:
-
-                    start_index = path.index(
-                        neighbor
-                    )
-
-                    cycle = (
-                        path[start_index:]
-                        + [neighbor]
-                    )
-
-                    if cycle not in cycles:
-                        cycles.append(cycle)
-
-                except ValueError:
-                    pass
-
-        path.pop()
-        recursion_stack.remove(node)
-
-    for node in graph:
-
-        if node not in visited:
-
-            dfs(
-                node,
-                []
-            )
-
-    return cycles
-
-
-# ============================================================
-# DEADLOCK INFORMATION
-# ============================================================
-
-def get_deadlock_information(nodes, edges):
-
-    cycles = find_cycles(
-        nodes,
-        edges
+    return ", ".join(
+        f"{resources[i]}: {values[i]}"
+        for i in range(len(resources))
     )
 
-    allocations = []
-    requests = []
 
-    for edge in edges:
+def resource_name_in_question(question, resources):
+    """
+    Return the index of a specifically mentioned resource.
+    """
 
-        if edge["type"] == "allocation":
+    question_lower = question.lower()
 
-            allocations.append({
-                "resource": edge["source"],
-                "process": edge["target"],
-                "amount": edge["label"]
-            })
+    for i, resource in enumerate(resources):
 
-        elif edge["type"] == "request":
+        if resource.lower() in question_lower:
+            return i
 
-            requests.append({
-                "process": edge["source"],
-                "resource": edge["target"],
-                "amount": edge["label"]
-            })
+    return None
 
-    return {
-        "type": "deadlock_analysis",
-        "has_cycle": len(cycles) > 0,
-        "cycles": cycles,
-        "allocations": allocations,
-        "requests": requests
-    }
+
+def is_hypothetical_question(question):
+    """
+    Detect hypothetical questions.
+    """
+
+    question_lower = question.lower()
+
+    phrases = [
+        "what would happen if",
+        "what if",
+        "suppose",
+        "assuming",
+        "hypothetically",
+        "if p0 needed",
+        "if p1 needed",
+        "if p2 needed",
+        "if p3 needed",
+        "if p4 needed",
+        "if p0 requested",
+        "if p1 requested",
+        "if p2 requested",
+        "if p3 requested",
+        "if p4 requested"
+    ]
+
+    return any(
+        phrase in question_lower
+        for phrase in phrases
+    )
 
 
 # ============================================================
-# RAG RETRIEVAL
+# CONCEPTUAL QUESTION DETECTION
 # ============================================================
 
-def retrieve_graph_context(
-    query,
-    nodes,
-    edges
-):
+def is_conceptual_question(question):
+    """
+    Questions that are primarily asking for an explanation.
 
-    query = query.lower()
+    These can be handled by the local LLM using authoritative
+    RAG context.
+    """
+
+    question_lower = question.lower().strip()
+
+    phrases = [
+        "explain",
+        "what is",
+        "what are",
+        "how does",
+        "how do",
+        "why does",
+        "why do",
+        "simply",
+        "in simple terms",
+        "meaning of",
+        "define",
+        "describe"
+    ]
+
+    return any(
+        phrase in question_lower
+        for phrase in phrases
+    )
+
+
+# ============================================================
+# RAG CONTEXT GENERATOR
+# ============================================================
+
+def generate_context(question, allocator):
+    """
+    Generate authoritative context directly from the CURRENT
+    ResourceAllocator state.
+
+    The allocator is the source of truth.
+
+    The LLM never decides:
+    - resource quantities
+    - allocation values
+    - maximum values
+    - need values
+    - safety
+    - deadlock
+    """
+
+    question_lower = question.lower()
+
+    state = allocator.get_state()
+
+    resources = allocator.resources
+    processes = allocator.process_names
+
+    maximum = state["maximum"]
+    allocation = state["allocation"]
+    available = state["available"]
+
+    need = calculate_need(
+        maximum,
+        allocation
+    )
 
     context = []
 
-    # --------------------------------------------------------
-    # PROCESS RETRIEVAL
-    # --------------------------------------------------------
-
-    for node in nodes:
-
-        if node["type"] != "process":
-            continue
-
-        process_id = node["id"]
-
-        if process_id.lower() in query:
-
-            context.append(
-                get_process_information(
-                    process_id,
-                    edges
-                )
-            )
-
-    # --------------------------------------------------------
-    # RESOURCE RETRIEVAL
-    # --------------------------------------------------------
-
-    for node in nodes:
-
-        if node["type"] != "resource":
-            continue
-
-        resource_id = node["id"]
-
-        if resource_id.lower() in query:
-
-            context.append(
-                get_resource_information(
-                    resource_id,
-                    edges
-                )
-            )
-
-    # --------------------------------------------------------
-    # DEADLOCK RETRIEVAL
-    # --------------------------------------------------------
-
-    deadlock_keywords = [
-        "deadlock",
-        "deadlocked",
-        "circular wait",
-        "cycle",
-        "waiting",
-        "blocked",
-        "cause",
-        "causing"
-    ]
-
-    if any(
-        keyword in query
-        for keyword in deadlock_keywords
-    ):
-
-        context.append(
-            get_deadlock_information(
-                nodes,
-                edges
-            )
-        )
-
-    # --------------------------------------------------------
-    # FALLBACK
-    # --------------------------------------------------------
-
-    if not context:
-
-        context.append({
-            "type": "complete_graph",
-            "nodes": nodes,
-            "edges": edges
-        })
-
-    return context
-
-
-# ============================================================
-# FORMAT CONTEXT
-# ============================================================
-
-def format_context(context):
-
-    output = []
-
-    output.append(
-        "RESOURCE ALLOCATION GRAPH CONTEXT"
-    )
-
-    output.append(
-        "=" * 40
-    )
-
-    for item in context:
-
-        if "process" in item:
-
-            output.append(
-                f"\nProcess: {item['process']}"
-            )
-
-            output.append(
-                "Allocated resources:"
-            )
-
-            if item["allocated_resources"]:
-
-                for resource in item[
-                    "allocated_resources"
-                ]:
-
-                    output.append(
-                        f"- {resource['resource']}: "
-                        f"{resource['amount']}"
-                    )
-
-            else:
-
-                output.append("- None")
-
-            output.append(
-                "Requested resources:"
-            )
-
-            if item["requested_resources"]:
-
-                for resource in item[
-                    "requested_resources"
-                ]:
-
-                    output.append(
-                        f"- {resource['resource']}: "
-                        f"{resource['amount']}"
-                    )
-
-            else:
-
-                output.append("- None")
-
-        elif "resource" in item:
-
-            output.append(
-                f"\nResource: {item['resource']}"
-            )
-
-            output.append(
-                "Allocated to:"
-            )
-
-            if item["allocated_to"]:
-
-                for process in item["allocated_to"]:
-
-                    output.append(
-                        f"- {process['process']}: "
-                        f"{process['amount']}"
-                    )
-
-            else:
-
-                output.append("- None")
-
-            output.append(
-                "Requested by:"
-            )
-
-            if item["requested_by"]:
-
-                for process in item["requested_by"]:
-
-                    output.append(
-                        f"- {process['process']}: "
-                        f"{process['amount']}"
-                    )
-
-            else:
-
-                output.append("- None")
-
-        elif item.get("type") == "deadlock_analysis":
-
-            output.append(
-                "\nDeadlock Analysis:"
-            )
-
-            if item["has_cycle"]:
-
-                output.append(
-                    "Circular wait detected."
-                )
-
-                output.append(
-                    "\nDetected Cycle(s):"
-                )
-
-                for cycle in item["cycles"]:
-
-                    output.append(
-                        "- " + " -> ".join(cycle)
-                    )
-
-            else:
-
-                output.append(
-                    "No cycle detected."
-                )
-
-            output.append(
-                "\nCurrent Resource Allocations:"
-            )
-
-            for allocation in item["allocations"]:
-
-                output.append(
-                    f"- {allocation['resource']} "
-                    f"is allocated to "
-                    f"{allocation['process']} "
-                    f"({allocation['amount']})"
-                )
-
-            output.append(
-                "\nCurrent Resource Requests:"
-            )
-
-            for request in item["requests"]:
-
-                output.append(
-                    f"- {request['process']} "
-                    f"is requesting "
-                    f"{request['resource']} "
-                    f"({request['amount']})"
-                )
-
-        elif item.get("type") == "complete_graph":
-
-            output.append(
-                "\nComplete Graph:"
-            )
-
-            for node in item["nodes"]:
-
-                output.append(
-                    f"- {node['id']} "
-                    f"({node['type']})"
-                )
-
-            for edge in item["edges"]:
-
-                output.append(
-                    f"- {edge['source']} -> "
-                    f"{edge['target']} "
-                    f"[{edge['type']}] "
-                    f"{edge['label']}"
-                )
-
-    return "\n".join(output)
-
-
-# ============================================================
-# DETERMINISTIC GRAPH FACTS
-# ============================================================
-
-def get_graph_facts(nodes, edges):
-
-    deadlock = get_deadlock_information(
-        nodes,
-        edges
-    )
-
-    allocation_map = {}
-
-    for allocation in deadlock["allocations"]:
-
-        allocation_map[
-            allocation["resource"]
-        ] = allocation["process"]
-
-    process_holds = {}
-
-    for allocation in deadlock["allocations"]:
-
-        process = allocation["process"]
-        resource = allocation["resource"]
-
-        if process not in process_holds:
-            process_holds[process] = []
-
-        process_holds[process].append(
-            resource
-        )
-
-    process_waits = {}
-
-    for request in deadlock["requests"]:
-
-        process = request["process"]
-        resource = request["resource"]
-
-        process_waits[process] = {
-            "resource": resource,
-            "holder": allocation_map.get(
-                resource
-            )
-        }
-
-    return (
-        deadlock,
-        allocation_map,
-        process_holds,
-        process_waits
-    )
-
-
-# ============================================================
-# INTENT DETECTION
-# ============================================================
-
-def detect_intent(query):
-
-    q = query.lower()
-
-    if (
-        "what is" in q
-        and "waiting for" in q
-    ):
-        return "process_waiting"
-
-    if (
-        "what is" in q
-        and "wait" in q
-    ):
-        return "process_waiting"
-
-    if (
-        "what resource" in q
-        and (
-            "hold" in q
-            or "holds" in q
-        )
-    ):
-        return "process_holds"
-
-    if (
-        "what does" in q
-        and (
-            "hold" in q
-            or "holds" in q
-        )
-    ):
-        return "process_holds"
-
-    if (
-        "why is" in q
-        and (
-            "waiting" in q
-            or "wait" in q
-        )
-    ):
-        return "process_waiting_explanation"
-
-    if (
-        "deadlock" in q
-        or "circular wait" in q
-        or "deadlocked" in q
-    ):
-        return "deadlock_explanation"
-
-    if (
-        "which process" in q
-        and (
-            "cause" in q
-            or "causing" in q
-            or "deadlock" in q
-        )
-    ):
-        return "deadlock_processes"
-
-    return "llm"
-
-
-# ============================================================
-# FIND PROCESS IN QUESTION
-# ============================================================
-
-def find_process_in_question(
-    query,
-    processes
-):
-
-    query_upper = query.upper()
-
-    for process in processes:
-
-        if process.upper() in query_upper:
-            return process
-
-    return None
-
-
-# ============================================================
-# DETERMINISTIC ANSWER
-# ============================================================
-
-def deterministic_answer(
-    query,
-    nodes,
-    edges,
-    processes
-):
-
-    intent = detect_intent(
-        query
-    )
-
-    (
-        deadlock,
-        allocation_map,
-        process_holds,
-        process_waits
-    ) = get_graph_facts(
-        nodes,
-        edges
-    )
-
-    process = find_process_in_question(
-        query,
+    process_id = find_process(
+        question,
         processes
     )
 
-    # --------------------------------------------------------
-    # WHAT IS PROCESS WAITING FOR?
-    # --------------------------------------------------------
+    # ========================================================
+    # HYPOTHETICAL REQUEST
+    #
+    # IMPORTANT:
+    # This block is intentionally processed FIRST.
+    # Otherwise a question such as:
+    #
+    # "What would happen if P0 needed all remaining resources?"
+    #
+    # could accidentally be answered as a normal "remaining need"
+    # question.
+    # ========================================================
 
-    if intent == "process_waiting":
+    if is_hypothetical_question(question):
 
-        if process is None:
-            return None
-
-        if process not in process_waits:
-            return (
-                f"{process} is not currently "
-                "waiting for any resource."
-            )
-
-        resource = process_waits[
-            process
-        ]["resource"]
-
-        holder = process_waits[
-            process
-        ]["holder"]
-
-        if holder:
-
-            return (
-                f"{process} is waiting for {resource}. "
-                f"{resource} is currently held by {holder}."
-            )
-
-        return (
-            f"{process} is waiting for {resource}, "
-            "which is currently available."
+        context.append(
+            "IMPORTANT: This is a hypothetical question."
         )
 
-    # --------------------------------------------------------
-    # WHAT RESOURCE DOES PROCESS HOLD?
-    # --------------------------------------------------------
-
-    if intent == "process_holds":
-
-        if process is None:
-            return None
-
-        resources_held = process_holds.get(
-            process,
-            []
+        context.append(
+            "The hypothetical situation MUST NOT modify the "
+            "actual allocator state."
         )
 
-        if not resources_held:
+        if process_id is not None:
 
-            return (
-                f"{process} currently holds no resources."
+            process_name = processes[process_id]
+
+            current_need = need[process_id]
+
+            context.append(
+                f"Hypothetical process: {process_name}"
             )
 
-        return (
-            f"{process} currently holds: "
-            + ", ".join(resources_held)
-            + "."
-        )
-
-    # --------------------------------------------------------
-    # WHY IS PROCESS WAITING?
-    # --------------------------------------------------------
-
-    if intent == "process_waiting_explanation":
-
-        if process is None:
-            return None
-
-        if process not in process_waits:
-            return (
-                f"{process} is not currently "
-                "waiting for a resource."
+            context.append(
+                "Current allocation: "
+                + format_resources(
+                    resources,
+                    allocation[process_id]
+                )
             )
 
-        resources_held = process_holds.get(
-            process,
-            []
-        )
-
-        resource = process_waits[
-            process
-        ]["resource"]
-
-        holder = process_waits[
-            process
-        ]["holder"]
-
-        held_text = (
-            ", ".join(resources_held)
-            if resources_held
-            else "no resources"
-        )
-
-        if holder:
-
-            return (
-                f"{process} holds {held_text} "
-                f"and is waiting for {resource}. "
-                f"However, {resource} is currently "
-                f"held by {holder}, so {process} "
-                "cannot obtain it until the resource "
-                "is released."
+            context.append(
+                "Current remaining need: "
+                + format_resources(
+                    resources,
+                    current_need
+                )
             )
 
-        return (
-            f"{process} holds {held_text} "
-            f"and is waiting for {resource}."
-        )
-
-    # --------------------------------------------------------
-    # WHICH PROCESSES ARE INVOLVED?
-    # --------------------------------------------------------
-
-    if intent == "deadlock_processes":
-
-        if not deadlock["has_cycle"]:
-
-            return (
-                "No deadlock was detected."
+            context.append(
+                "Current available resources: "
+                + format_resources(
+                    resources,
+                    available
+                )
             )
 
-        involved = []
-
-        for cycle in deadlock["cycles"]:
-
-            for node in cycle:
-
-                if node in processes:
-                    involved.append(node)
-
-        involved = list(
-            dict.fromkeys(involved)
-        )
-
-        return (
-            "The processes involved in the deadlock "
-            "are: "
-            + ", ".join(involved)
-            + "."
-        )
-
-    # --------------------------------------------------------
-    # DEADLOCK EXPLANATION
-    # --------------------------------------------------------
-
-    if intent == "deadlock_explanation":
-
-        if not deadlock["has_cycle"]:
-
-            return (
-                "The Resource Allocation Graph does "
-                "not contain a cycle, so no deadlock "
-                "was detected."
+            can_satisfy = all(
+                current_need[j] <= available[j]
+                for j in range(len(resources))
             )
 
-        explanation = []
+            if can_satisfy:
 
-        explanation.append(
-            "The system is deadlocked because the "
-            "Resource Allocation Graph contains a "
-            "circular wait."
-        )
-
-        for request in deadlock["requests"]:
-
-            process_name = request[
-                "process"
-            ]
-
-            resource_name = request[
-                "resource"
-            ]
-
-            holder = allocation_map.get(
-                resource_name
-            )
-
-            held = process_holds.get(
-                process_name,
-                []
-            )
-
-            held_text = (
-                ", ".join(held)
-                if held
-                else "no resources"
-            )
-
-            if holder:
-
-                explanation.append(
-                    f"{process_name} holds "
-                    f"{held_text} and waits for "
-                    f"{resource_name}, which is "
-                    f"held by {holder}."
+                context.append(
+                    "The complete remaining need of this process "
+                    "is currently within the available resources."
                 )
 
-        explanation.append(
-            "This creates the cycle: "
-            + " -> ".join(
-                deadlock["cycles"][0]
+                context.append(
+                    "Therefore the complete hypothetical request "
+                    "could currently be satisfied based only on "
+                    "resource availability."
+                )
+
+            else:
+
+                context.append(
+                    "The complete remaining need of this process "
+                    "cannot currently be satisfied by the "
+                    "available resources."
+                )
+
+                for j, resource in enumerate(resources):
+
+                    if current_need[j] > available[j]:
+
+                        context.append(
+                            f"- {resource}: needs "
+                            f"{current_need[j]}, but only "
+                            f"{available[j]} is available."
+                        )
+
+            context.append(
+                "The actual allocator state has NOT been changed."
             )
+
+        else:
+
+            context.append(
+                "No specific process was identified in the "
+                "hypothetical question."
+            )
+
+        return "\n".join(context)
+
+    # ========================================================
+    # PROCESS INFORMATION
+    # ========================================================
+
+    if process_id is not None:
+
+        process_name = processes[process_id]
+
+        # ----------------------------------------------------
+        # CURRENTLY HOLDS
+        # ----------------------------------------------------
+
+        if any(
+            phrase in question_lower
+            for phrase in [
+                "hold",
+                "holds",
+                "currently allocated",
+                "what resources does"
+            ]
+        ):
+
+            context.append(
+                f"Process {process_name} currently holds:"
+            )
+
+            for j, resource in enumerate(resources):
+
+                context.append(
+                    f"- {resource}: "
+                    f"{allocation[process_id][j]}"
+                )
+
+        # ----------------------------------------------------
+        # REMAINING NEED
+        # ----------------------------------------------------
+
+        if (
+            "remaining need" in question_lower
+            or "still need" in question_lower
+            or "remaining resources" in question_lower
+            or (
+                "need" in question_lower
+                and "maximum" not in question_lower
+                and "matrix" not in question_lower
+            )
+        ):
+
+            context.append(
+                f"Process {process_name}'s remaining need:"
+            )
+
+            has_need = False
+
+            for j, resource in enumerate(resources):
+
+                if need[process_id][j] > 0:
+
+                    has_need = True
+
+                    context.append(
+                        f"- {resource}: "
+                        f"{need[process_id][j]}"
+                    )
+
+            if not has_need:
+
+                context.append(
+                    "- None"
+                )
+
+        # ----------------------------------------------------
+        # MAXIMUM
+        # ----------------------------------------------------
+
+        if (
+            "maximum" in question_lower
+            or "max need" in question_lower
+            or "maximum need" in question_lower
+        ):
+
+            context.append(
+                f"Process {process_name}'s declared maximum:"
+            )
+
+            for j, resource in enumerate(resources):
+
+                context.append(
+                    f"- {resource}: "
+                    f"{maximum[process_id][j]}"
+                )
+
+    # ========================================================
+    # AVAILABLE RESOURCES
+    # ========================================================
+
+    if (
+        "available" in question_lower
+        or "free resource" in question_lower
+        or "free resources" in question_lower
+    ):
+
+        context.append(
+            "Current available resources:"
         )
 
-        explanation.append(
-            "Because every process in the cycle is "
-            "waiting for a resource held by another "
-            "process in the same cycle, none of them "
-            "can proceed."
+        for j, resource in enumerate(resources):
+
+            context.append(
+                f"{resource}: {available[j]}"
+            )
+
+    # ========================================================
+    # SPECIFIC RESOURCE
+    # ========================================================
+
+    resource_id = resource_name_in_question(
+        question,
+        resources
+    )
+
+    if (
+        resource_id is not None
+        and (
+            "available" in question_lower
+            or "free" in question_lower
+        )
+    ):
+
+        resource = resources[resource_id]
+
+        context.append(
+            f"{resource} currently available: "
+            f"{available[resource_id]}"
         )
 
-        return " ".join(
-            explanation
+    # ========================================================
+    # ALLOCATION MATRIX
+    # ========================================================
+
+    if (
+        "allocation matrix" in question_lower
+        or "allocation table" in question_lower
+    ):
+
+        context.append(
+            "Current Allocation Matrix:"
         )
 
-    return None
+        for i, process in enumerate(processes):
+
+            context.append(
+                f"{process}: "
+                + format_resources(
+                    resources,
+                    allocation[i]
+                )
+            )
+
+    # ========================================================
+    # MAXIMUM MATRIX
+    # ========================================================
+
+    if (
+        "maximum matrix" in question_lower
+        or "max matrix" in question_lower
+        or "maximum table" in question_lower
+    ):
+
+        context.append(
+            "Current Maximum Matrix:"
+        )
+
+        for i, process in enumerate(processes):
+
+            context.append(
+                f"{process}: "
+                + format_resources(
+                    resources,
+                    maximum[i]
+                )
+            )
+
+    # ========================================================
+    # NEED MATRIX
+    # ========================================================
+
+    if (
+        "need matrix" in question_lower
+        or "need table" in question_lower
+    ):
+
+        context.append(
+            "Current Need Matrix:"
+        )
+
+        for i, process in enumerate(processes):
+
+            context.append(
+                f"{process}: "
+                + format_resources(
+                    resources,
+                    need[i]
+                )
+            )
+
+    # ========================================================
+    # COMPLETE SYSTEM STATE
+    # ========================================================
+
+    if any(
+        phrase in question_lower
+        for phrase in [
+            "system state",
+            "current state",
+            "everything",
+            "all resources",
+            "full state",
+            "resource allocation situation",
+            "resource allocation",
+            "allocation situation"
+        ]
+    ):
+
+        context = []
+
+        context.append(
+            "IMPORTANT: The following is the COMPLETE CURRENT "
+            "resource allocation state."
+        )
+
+        context.append(
+            "Use it as the ONLY source of truth for system facts."
+        )
+
+        context.append("")
+
+        context.append(
+            "Current available resources:"
+        )
+
+        for j, resource in enumerate(resources):
+
+            context.append(
+                f"- {resource}: {available[j]}"
+            )
+
+        context.append("")
+
+        context.append(
+            "Current Allocation Matrix:"
+        )
+
+        for i, process in enumerate(processes):
+
+            context.append(
+                f"- {process}: "
+                + format_resources(
+                    resources,
+                    allocation[i]
+                )
+            )
+
+        context.append("")
+
+        context.append(
+            "Current Maximum Matrix:"
+        )
+
+        for i, process in enumerate(processes):
+
+            context.append(
+                f"- {process}: "
+                + format_resources(
+                    resources,
+                    maximum[i]
+                )
+            )
+
+        context.append("")
+
+        context.append(
+            "Current Need Matrix:"
+        )
+
+        for i, process in enumerate(processes):
+
+            context.append(
+                f"- {process}: "
+                + format_resources(
+                    resources,
+                    need[i]
+                )
+            )
+
+        # ----------------------------------------------------
+        # SAFETY
+        # ----------------------------------------------------
+
+        from banker import is_safe
+
+        safe, sequence = is_safe(
+            available,
+            maximum,
+            allocation
+        )
+
+        context.append("")
+        context.append(
+            "Banker's Algorithm:"
+        )
+
+        if safe:
+
+            sequence_names = [
+                processes[i]
+                for i in sequence
+            ]
+
+            context.append(
+                "- System is SAFE."
+            )
+
+            context.append(
+                "- Safe sequence: "
+                + " -> ".join(sequence_names)
+            )
+
+        else:
+
+            context.append(
+                "- System is NOT SAFE."
+            )
+
+        # ----------------------------------------------------
+        # DEADLOCK
+        # ----------------------------------------------------
+
+        from deadlock import detect_deadlock
+
+        deadlock, deadlocked = detect_deadlock(
+            available,
+            allocation,
+            need
+        )
+
+        context.append("")
+        context.append(
+            "Deadlock Detection:"
+        )
+
+        if deadlock:
+
+            names = [
+                processes[i]
+                for i in deadlocked
+            ]
+
+            context.append(
+                "- Deadlock detected."
+            )
+
+            context.append(
+                "- Deadlocked processes: "
+                + ", ".join(names)
+            )
+
+        else:
+
+            context.append(
+                "- No deadlock is detected."
+            )
+
+    # ========================================================
+    # BANKER'S SAFETY
+    # ========================================================
+
+    if any(
+        phrase in question_lower
+        for phrase in [
+            "safe",
+            "safety",
+            "banker",
+            "banker's"
+        ]
+    ):
+
+        from banker import is_safe
+
+        safe, sequence = is_safe(
+            available,
+            maximum,
+            allocation
+        )
+
+        if safe:
+
+            sequence_names = [
+                processes[i]
+                for i in sequence
+            ]
+
+            context.append(
+                "The current system is in a SAFE state."
+            )
+
+            context.append(
+                "Safe sequence: "
+                + " -> ".join(sequence_names)
+            )
+
+            context.append(
+                "The safe sequence represents a possible "
+                "order in which processes can finish."
+            )
+
+        else:
+
+            context.append(
+                "The current system is NOT in a SAFE state."
+            )
+
+            context.append(
+                "No complete safe sequence exists."
+            )
+
+    # ========================================================
+    # DEADLOCK
+    # ========================================================
+
+    if any(
+        phrase in question_lower
+        for phrase in [
+            "deadlock",
+            "deadlocked",
+            "circular wait",
+            "cycle"
+        ]
+    ):
+
+        from deadlock import detect_deadlock
+
+        deadlock, deadlocked = detect_deadlock(
+            available,
+            allocation,
+            need
+        )
+
+        if deadlock:
+
+            names = [
+                processes[i]
+                for i in deadlocked
+            ]
+
+            context.append(
+                "Deadlock detected in the current system."
+            )
+
+            context.append(
+                "Deadlocked processes: "
+                + ", ".join(names)
+            )
+
+        else:
+
+            context.append(
+                "No deadlock is detected in the current system."
+            )
+
+    # ========================================================
+    # FALLBACK
+    # ========================================================
+
+    if not context:
+
+        context.append(
+            "Current system state:"
+        )
+
+        context.append(
+            "Available resources:"
+        )
+
+        for j, resource in enumerate(resources):
+
+            context.append(
+                f"{resource}: {available[j]}"
+            )
+
+        context.append(
+            "Processes: "
+            + ", ".join(processes)
+        )
+
+    return "\n".join(context)
 
 
 # ============================================================
-# LOAD LOCAL LLM
+# LOCAL TRANSFORMERS MODEL
+#
+# This function is retained for compatibility.
+#
+# The current project normally uses llama-server instead.
 # ============================================================
 
-def load_llm():
+def load_model():
 
-    model_name = (
-        "Qwen/Qwen2.5-0.5B-Instruct"
-    )
+    global _TOKENIZER
+    global _MODEL
 
-    device = (
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
+    if _TOKENIZER is not None and _MODEL is not None:
 
-    print("=" * 60)
+        print("\n" + "=" * 60)
+        print("LOCAL LLM ALREADY LOADED")
+        print("=" * 60)
+
+        print(
+            "\nReusing the existing model."
+        )
+
+        print(
+            f"Model: {MODEL_NAME}"
+        )
+
+        print(
+            f"Device: {DEVICE}"
+        )
+
+        return _TOKENIZER, _MODEL
+
+    print("\n" + "=" * 60)
     print("LOADING LOCAL LLM")
     print("=" * 60)
 
     print(
-        f"\nModel: {model_name}"
+        f"\nModel: {MODEL_NAME}"
     )
 
     print(
-        f"Device: {device}"
+        f"Device: {DEVICE}\n"
     )
 
     print(
-        "\nLoading model..."
+        "Loading model for the first time..."
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name
+    print(
+        "This may take a while because the model "
+        "is running on CPU."
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name
-    )
+    try:
 
-    model.to(device)
-    model.eval()
+        _TOKENIZER = AutoTokenizer.from_pretrained(
+            MODEL_NAME
+        )
+
+        _MODEL = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            dtype=torch.float32,
+            low_cpu_mem_usage=True
+        )
+
+        _MODEL.to(DEVICE)
+
+        _MODEL.eval()
+
+    except Exception as e:
+
+        print(
+            "\nERROR: Failed to load the local LLM."
+        )
+
+        print(
+            f"Details: {e}"
+        )
+
+        raise
 
     print(
         "\nModel loaded successfully!"
     )
 
-    return (
-        tokenizer,
-        model,
-        device
-    )
+    return _TOKENIZER, _MODEL
 
 
 # ============================================================
-# LLM ANSWER
+# FACTUAL ANSWER GENERATOR
+# ============================================================
+
+def generate_factual_answer(
+    question,
+    context,
+    allocator
+):
+    """
+    Deterministic answer engine.
+
+    This runs BEFORE the LLM.
+
+    Numerical/resource/state questions should NEVER depend
+    on the LLM.
+    """
+
+    question_lower = question.lower().strip()
+
+    state = allocator.get_state()
+
+    resources = allocator.resources
+    processes = allocator.process_names
+
+    maximum = state["maximum"]
+    allocation = state["allocation"]
+    available = state["available"]
+
+    need = calculate_need(
+        maximum,
+        allocation
+    )
+
+    process_id = find_process(
+        question,
+        processes
+    )
+
+    # ========================================================
+    # HYPOTHETICAL REQUEST
+    #
+    # IMPORTANT:
+    # This MUST come before the normal "remaining need" block.
+    # ========================================================
+
+    if (
+        process_id is not None
+        and is_hypothetical_question(question)
+    ):
+
+        process_name = processes[process_id]
+
+        current_need = need[process_id]
+
+        need_text = format_resources(
+            resources,
+            current_need
+        )
+
+        available_text = format_resources(
+            resources,
+            available
+        )
+
+        can_satisfy = all(
+            current_need[j] <= available[j]
+            for j in range(len(resources))
+        )
+
+        if can_satisfy:
+
+            return (
+                f"If {process_name} requested all of its "
+                f"remaining resources, the request could "
+                f"currently be satisfied based on the available "
+                f"resources. {process_name}'s remaining need is "
+                f"{need_text}, while currently available "
+                f"resources are {available_text}. "
+                f"This is only a hypothetical situation; "
+                f"the actual allocator state has not been changed."
+            )
+
+        explanations = []
+
+        for j, resource in enumerate(resources):
+
+            if current_need[j] > available[j]:
+
+                explanations.append(
+                    f"{resource}: needs {current_need[j]}, "
+                    f"but only {available[j]} is available"
+                )
+
+        return (
+            f"If {process_name} requested all of its remaining "
+            f"resources right now, the request could not be "
+            f"immediately satisfied. "
+            f"{process_name}'s remaining need is "
+            f"{need_text}. "
+            f"Currently available resources are "
+            f"{available_text}. "
+            f"Specifically: "
+            + "; ".join(explanations)
+            + ". "
+            "The actual allocator state has not been changed."
+        )
+
+    # ========================================================
+    # PROCESS HOLDS
+    # ========================================================
+
+    if (
+        process_id is not None
+        and (
+            "hold" in question_lower
+            or "holds" in question_lower
+            or "currently allocated" in question_lower
+            or (
+                "allocated" in question_lower
+                and "matrix" not in question_lower
+            )
+        )
+    ):
+
+        values = []
+
+        for j, resource in enumerate(resources):
+
+            values.append(
+                f"{resource}: "
+                f"{allocation[process_id][j]}"
+            )
+
+        return (
+            f"{processes[process_id]} holds "
+            + ", ".join(values)
+            + "."
+        )
+
+    # ========================================================
+    # REMAINING NEED
+    # ========================================================
+
+    if (
+        process_id is not None
+        and (
+            "remaining need" in question_lower
+            or "still need" in question_lower
+            or "remaining resources" in question_lower
+            or (
+                "need" in question_lower
+                and "maximum" not in question_lower
+                and "matrix" not in question_lower
+                and not is_hypothetical_question(question)
+            )
+        )
+    ):
+
+        values = []
+
+        for j, resource in enumerate(resources):
+
+            if need[process_id][j] > 0:
+
+                values.append(
+                    f"{resource}: "
+                    f"{need[process_id][j]}"
+                )
+
+        if not values:
+
+            return (
+                f"{processes[process_id]} "
+                "has no remaining resource need."
+            )
+
+        return (
+            f"{processes[process_id]}'s remaining need is "
+            + ", ".join(values)
+            + "."
+        )
+
+    # ========================================================
+    # MAXIMUM NEED
+    # ========================================================
+
+    if (
+        process_id is not None
+        and (
+            "maximum need" in question_lower
+            or "max need" in question_lower
+            or (
+                "maximum" in question_lower
+                and "matrix" not in question_lower
+            )
+        )
+    ):
+
+        values = []
+
+        for j, resource in enumerate(resources):
+
+            values.append(
+                f"{resource}: "
+                f"{maximum[process_id][j]}"
+            )
+
+        return (
+            f"{processes[process_id]}'s declared maximum is "
+            + ", ".join(values)
+            + "."
+        )
+
+    # ========================================================
+    # AVAILABLE RESOURCE
+    # ========================================================
+
+    if (
+        "available" in question_lower
+        or "free resource" in question_lower
+        or "free resources" in question_lower
+    ):
+
+        resource_id = resource_name_in_question(
+            question,
+            resources
+        )
+
+        if resource_id is not None:
+
+            resource = resources[resource_id]
+
+            return (
+                f"There are currently "
+                f"{available[resource_id]} "
+                f"{resource} resources available."
+            )
+
+        return (
+            "Currently available resources: "
+            + ", ".join(
+                f"{resources[j]}: {available[j]}"
+                for j in range(len(resources))
+            )
+            + "."
+        )
+
+    # ========================================================
+    # ALLOCATION MATRIX
+    # ========================================================
+
+    if (
+        "allocation matrix" in question_lower
+        or "allocation table" in question_lower
+    ):
+
+        answer = (
+            "The current allocation matrix is:\n"
+        )
+
+        for i, process in enumerate(processes):
+
+            answer += (
+                f"{process}: "
+                + format_resources(
+                    resources,
+                    allocation[i]
+                )
+                + "\n"
+            )
+
+        return answer.strip()
+
+    # ========================================================
+    # MAXIMUM MATRIX
+    # ========================================================
+
+    if (
+        "maximum matrix" in question_lower
+        or "max matrix" in question_lower
+        or "maximum table" in question_lower
+    ):
+
+        answer = (
+            "The current maximum matrix is:\n"
+        )
+
+        for i, process in enumerate(processes):
+
+            answer += (
+                f"{process}: "
+                + format_resources(
+                    resources,
+                    maximum[i]
+                )
+                + "\n"
+            )
+
+        return answer.strip()
+
+    # ========================================================
+    # NEED MATRIX
+    # ========================================================
+
+    if (
+        "need matrix" in question_lower
+        or "need table" in question_lower
+    ):
+
+        answer = (
+            "The current need matrix is:\n"
+        )
+
+        for i, process in enumerate(processes):
+
+            answer += (
+                f"{process}: "
+                + format_resources(
+                    resources,
+                    need[i]
+                )
+                + "\n"
+            )
+
+        return answer.strip()
+
+    # ========================================================
+    # SYSTEM SAFE?
+    # ========================================================
+
+    if (
+        "is the system safe" in question_lower
+        or "system safe" in question_lower
+        or question_lower in [
+            "is it safe",
+            "safe?",
+            "is it in a safe state"
+        ]
+    ):
+
+        from banker import is_safe
+
+        safe, sequence = is_safe(
+            available,
+            maximum,
+            allocation
+        )
+
+        if safe:
+
+            sequence_names = [
+                processes[i]
+                for i in sequence
+            ]
+
+            return (
+                "Yes, the system is safe. "
+                "The safe sequence is "
+                + " -> ".join(sequence_names)
+                + "."
+            )
+
+        return (
+            "No, the system is not safe. "
+            "There is no complete safe sequence."
+        )
+
+    # ========================================================
+    # WHY SYSTEM SAFE
+    # ========================================================
+
+    if (
+        "why" in question_lower
+        and "safe" in question_lower
+    ):
+
+        from banker import is_safe
+
+        safe, sequence = is_safe(
+            available,
+            maximum,
+            allocation
+        )
+
+        if not safe:
+
+            return (
+                "The system is not safe because "
+                "Banker's safety algorithm cannot find "
+                "a complete safe sequence."
+            )
+
+        sequence_names = [
+            processes[i]
+            for i in sequence
+        ]
+
+        work = available.copy()
+
+        explanation = []
+
+        explanation.append(
+            "The system is safe because Banker's Algorithm "
+            "can find a complete safe sequence."
+        )
+
+        explanation.append(
+            "Initially available resources are "
+            + format_resources(
+                resources,
+                work
+            )
+            + "."
+        )
+
+        for process_index in sequence:
+
+            process_name = processes[process_index]
+
+            required = need[process_index]
+
+            can_finish = all(
+                required[j] <= work[j]
+                for j in range(len(resources))
+            )
+
+            if not can_finish:
+
+                continue
+
+            explanation.append(
+                f"{process_name} can finish because its "
+                f"remaining need "
+                f"({format_resources(resources, required)}) "
+                f"can be satisfied by the currently available "
+                f"resources."
+            )
+
+            for j in range(len(resources)):
+
+                work[j] += allocation[process_index][j]
+
+            explanation.append(
+                f"After {process_name} finishes and releases "
+                f"its allocated resources, available resources "
+                f"become "
+                f"{format_resources(resources, work)}."
+            )
+
+        explanation.append(
+            "Therefore, all processes can potentially finish "
+            "in the order: "
+            + " -> ".join(sequence_names)
+            + "."
+        )
+
+        return "\n".join(explanation)
+
+    # ========================================================
+    # DEADLOCK STATUS
+    # ========================================================
+
+    if (
+        "is there a deadlock" in question_lower
+        or "is the system deadlocked" in question_lower
+        or (
+            "deadlock" in question_lower
+            and any(
+                word in question_lower
+                for word in [
+                    "detect",
+                    "detected",
+                    "exist",
+                    "present"
+                ]
+            )
+        )
+    ):
+
+        from deadlock import detect_deadlock
+
+        deadlock, deadlocked = detect_deadlock(
+            available,
+            allocation,
+            need
+        )
+
+        if deadlock:
+
+            names = [
+                processes[i]
+                for i in deadlocked
+            ]
+
+            return (
+                "Yes, a deadlock is detected. "
+                "Deadlocked processes: "
+                + ", ".join(names)
+                + "."
+            )
+
+        return (
+            "No deadlock is detected in the current system."
+        )
+
+    # ========================================================
+    # WHY DEADLOCK
+    # ========================================================
+
+    if (
+        "why" in question_lower
+        and "deadlock" in question_lower
+    ):
+
+        from deadlock import detect_deadlock
+
+        deadlock, deadlocked = detect_deadlock(
+            available,
+            allocation,
+            need
+        )
+
+        if not deadlock:
+
+            return (
+                "The current system is not deadlocked, "
+                "so there is no deadlock condition to explain."
+            )
+
+        names = [
+            processes[i]
+            for i in deadlocked
+        ]
+
+        explanation = []
+
+        explanation.append(
+            "A deadlock is detected involving "
+            + ", ".join(names)
+            + "."
+        )
+
+        explanation.append(
+            "These processes cannot currently obtain "
+            "their remaining required resources."
+        )
+
+        explanation.append(
+            "Because the required resources cannot be "
+            "satisfied, the affected processes cannot "
+            "complete and release their currently held "
+            "resources."
+        )
+
+        return " ".join(explanation)
+
+    # ========================================================
+    # CIRCULAR WAIT
+    # ========================================================
+
+    if (
+        "circular wait" in question_lower
+        or "circular waiting" in question_lower
+    ):
+
+        from deadlock import detect_deadlock
+
+        deadlock, deadlocked = detect_deadlock(
+            available,
+            allocation,
+            need
+        )
+
+        if not deadlock:
+
+            return (
+                "No deadlock is detected in the current "
+                "system state, so the detector does not "
+                "identify a circular-wait deadlock."
+            )
+
+        names = [
+            processes[i]
+            for i in deadlocked
+        ]
+
+        return (
+            "The deadlock detector identifies "
+            + ", ".join(names)
+            + " as blocked because their remaining "
+            "resource requirements cannot currently "
+            "be satisfied."
+        )
+
+    # ========================================================
+    # CURRENT STATE
+    # ========================================================
+
+    if (
+        "current state" in question_lower
+        or "system state" in question_lower
+        or "show everything" in question_lower
+    ):
+
+        answer = "Current system state:\n\n"
+
+        answer += "Available resources:\n"
+
+        answer += (
+            format_resources(
+                resources,
+                available
+            )
+            + "\n\n"
+        )
+
+        answer += "Allocation Matrix:\n"
+
+        for i, process in enumerate(processes):
+
+            answer += (
+                f"{process}: "
+                + format_resources(
+                    resources,
+                    allocation[i]
+                )
+                + "\n"
+            )
+
+        answer += "\nMaximum Matrix:\n"
+
+        for i, process in enumerate(processes):
+
+            answer += (
+                f"{process}: "
+                + format_resources(
+                    resources,
+                    maximum[i]
+                )
+                + "\n"
+            )
+
+        answer += "\nNeed Matrix:\n"
+
+        for i, process in enumerate(processes):
+
+            answer += (
+                f"{process}: "
+                + format_resources(
+                    resources,
+                    need[i]
+                )
+                + "\n"
+            )
+
+        return answer.strip()
+
+    # ========================================================
+    # PURE FACTUAL DEFINITIONS
+    #
+    # These don't require the LLM.
+    # ========================================================
+
+    if question_lower in [
+        "what is a deadlock?",
+        "what is deadlock",
+        "define deadlock",
+        "what does deadlock mean"
+    ]:
+
+        return (
+            "A deadlock happens when processes are stuck "
+            "waiting for resources held by other processes, "
+            "so none of the affected processes can continue. "
+            "In an operating system, deadlock can prevent "
+            "processes from completing and releasing the "
+            "resources they hold."
+        )
+
+    # ========================================================
+    # BANKER'S ALGORITHM EXPLANATION
+    #
+    # This is intentionally sent to the LLM because it is
+    # conceptual, but the current safe sequence is still
+    # provided as authoritative context.
+    # ========================================================
+
+    if (
+        "explain banker's algorithm" in question_lower
+        or "explain bankers algorithm" in question_lower
+        or "banker's algorithm simply" in question_lower
+        or "bankers algorithm simply" in question_lower
+    ):
+
+        return None
+
+    # ========================================================
+    # NO DETERMINISTIC ANSWER
+    # ========================================================
+
+    return None
+
+
+# ============================================================
+# LLAMA-SERVER ANSWER GENERATOR
 # ============================================================
 
 def generate_llm_answer(
     question,
     context,
-    tokenizer,
-    model,
-    device
+    tokenizer=None,
+    model=None
 ):
+    """
+    Use the local llama-server ONLY to explain authoritative
+    retrieved information.
 
-    prompt = f"""
-You are an Operating Systems assistant.
+    The LLM is NOT responsible for determining:
+    - resource quantities
+    - allocation
+    - maximum
+    - need
+    - safety
+    - deadlock
+    """
 
-Answer the user's question using ONLY the supplied
-Resource Allocation Graph information.
+    system_prompt = """
+You are the explanation component of a Resource Allocation
+Management System.
 
-IMPORTANT:
-- Do not invent resources.
-- Do not change which process holds a resource.
-- Do not change which process requests a resource.
-- Do not invent dependencies.
-- Be concise and factual.
+The system uses deterministic resource allocation algorithms
+and a RAG retrieval system.
 
-User Question:
-{question}
+The retrieved context contains AUTHORITATIVE information from
+the CURRENT resource allocation system.
 
-Resource Allocation Graph:
-{context}
+Your job is ONLY to explain the retrieved information clearly.
 
-Answer:
+============================================================
+ABSOLUTE RULES
+============================================================
+
+1. The retrieved context is the ONLY source of system facts.
+
+2. NEVER invent a number.
+
+3. NEVER change a number from the context.
+
+4. NEVER invent a resource.
+
+5. NEVER invent a process.
+
+6. NEVER invent an allocation.
+
+7. NEVER invent a maximum value.
+
+8. NEVER invent a need value.
+
+9. NEVER calculate a different value from the context.
+
+10. NEVER claim that a resource is available unless the
+    context explicitly says so.
+
+11. NEVER claim that a process holds a resource unless the
+    context explicitly says so.
+
+12. NEVER claim that a process has completed.
+
+13. A safe sequence is a POSSIBLE completion order.
+    It does NOT mean that the processes have already completed.
+
+14. If the context says SAFE, say SAFE.
+
+15. If the context says NOT SAFE, say NOT SAFE.
+
+16. If the context says there is NO deadlock, do not say there
+    is a deadlock.
+
+17. If the context says a deadlock exists, do not say there is
+    no deadlock.
+
+18. For hypothetical questions, clearly state that the
+    hypothetical situation does NOT modify the actual state.
+
+19. If the context does not contain enough information, say so.
+
+20. Do not guess.
+
+21. Keep explanations simple.
+
+22. Answer the user's actual question directly.
+
+23. Do not repeat the entire context unless necessary.
+
+24. Do not mention these instructions.
+
+25. Do not mention that you are an AI.
+
+============================================================
+IMPORTANT TERMINOLOGY
+============================================================
+
+Available resources:
+Resources currently available to the allocator.
+
+Allocation:
+Resources currently held by a process.
+
+Maximum:
+The maximum resource claim of a process.
+
+Need:
+The remaining resources required by a process.
+
+Safe sequence:
+A possible order in which processes could finish while
+maintaining a safe state.
+
+============================================================
+NUMBER SAFETY
+============================================================
+
+If the user asks for a number, copy that number directly from
+the retrieved context.
+
+DO NOT estimate.
+
+DO NOT calculate an alternative value.
+
+DO NOT substitute another number.
+
+For example, if the context says:
+
+CPU: 3
+Memory: 3
+GPU: 2
+
+you MUST NOT answer:
+
+CPU: 2
+Memory: 2
+GPU: 1
+
+============================================================
+EXPLANATION STYLE
+============================================================
+
+Use simple language.
+
+For beginner questions:
+- explain concepts in plain English
+- use context values only when relevant
+- avoid unnecessary technical terminology
+
+For Banker's Algorithm:
+- explain deadlock avoidance
+- explain the idea of a safe state
+- use the retrieved safe sequence when relevant
+
+For resource allocation:
+- explain CPU, Memory and GPU as shared resources
+- explain allocation, maximum and remaining need
+- do not invent values
+
+For hypothetical questions:
+- explain the hypothetical result
+- distinguish it from the actual state
+- explicitly say the actual state was not changed
 """
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a precise Operating Systems "
-                "assistant. Use only the supplied graph "
-                "evidence."
-            )
-        },
-        {
-            "role": "user",
-            "content": prompt
-        }
-    ]
 
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
+    user_prompt = f"""
+AUTHORITATIVE RETRIEVED CONTEXT
+================================
 
-    inputs = tokenizer(
-        text,
-        return_tensors="pt"
-    )
+{context}
 
-    inputs = {
-        key: value.to(device)
-        for key, value in inputs.items()
+================================
+USER QUESTION
+================================
+
+{question}
+
+================================
+TASK
+================================
+
+Answer the user's question using ONLY the authoritative
+retrieved context.
+
+Give a concise and accurate explanation.
+
+Do not invent facts or numbers.
+Do not modify the meaning of the context.
+"""
+
+
+    # --------------------------------------------------------
+    # Try llama-server
+    # --------------------------------------------------------
+
+    payload = {
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": user_prompt
+            }
+        ],
+        "temperature": 0.1,
+        "top_p": 0.9,
+        "max_tokens": 180,
+        "stream": False
     }
 
-    with torch.no_grad():
-
-        output = model.generate(
-            **inputs,
-            max_new_tokens=160,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
-
-    generated_tokens = output[
-        0
-    ][
-        inputs["input_ids"].shape[1]:
-    ]
-
-    answer = tokenizer.decode(
-        generated_tokens,
-        skip_special_tokens=True
+    response = requests.post(
+        f"{LLAMA_SERVER_URL}/v1/chat/completions",
+        json=payload,
+        timeout=180
     )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    try:
+
+        answer = data["choices"][0]["message"]["content"]
+
+    except (
+        KeyError,
+        IndexError,
+        TypeError
+    ):
+
+        raise RuntimeError(
+            "Unexpected response format from llama-server."
+        )
 
     return answer.strip()
 
 
 # ============================================================
-# MAIN
+# LLM OUTPUT VALIDATION
 # ============================================================
 
-if __name__ == "__main__":
+def validate_llm_answer(
+    answer,
+    context,
+    allocator
+):
+    """
+    Stronger validation for common hallucinations.
 
-    print("=" * 60)
-    print(
-        "RAG + LLM RESOURCE ALLOCATION SYSTEM"
+    The validator checks:
+    - unsupported claims
+    - safe/unsafe contradictions
+    - deadlock contradictions
+    - numbers that are not present in the context
+    """
+
+    if not answer:
+
+        return False
+
+    answer_lower = answer.lower()
+
+    context_lower = context.lower()
+
+    # --------------------------------------------------------
+    # Basic length
+    # --------------------------------------------------------
+
+    if len(answer.strip()) < 5:
+
+        return False
+
+    # --------------------------------------------------------
+    # Unsupported "optimal"
+    # --------------------------------------------------------
+
+    if (
+        "optimal" in answer_lower
+        and "optimal" not in context_lower
+    ):
+
+        return False
+
+    # --------------------------------------------------------
+    # Unsupported "perfect allocation"
+    # --------------------------------------------------------
+
+    if (
+        "perfect allocation" in answer_lower
+        and "perfect allocation" not in context_lower
+    ):
+
+        return False
+
+    # --------------------------------------------------------
+    # Unsupported "best allocation"
+    # --------------------------------------------------------
+
+    if (
+        "best allocation" in answer_lower
+        and "best allocation" not in context_lower
+    ):
+
+        return False
+
+    # --------------------------------------------------------
+    # Safe / unsafe contradiction
+    # --------------------------------------------------------
+
+    if (
+        "system is safe" in context_lower
+        and (
+            "system is unsafe" in answer_lower
+            or "system is not safe" in answer_lower
+        )
+    ):
+
+        return False
+
+    if (
+        "system is not safe" in context_lower
+        and
+        "system is safe" in answer_lower
+        and
+        "not safe" not in answer_lower
+    ):
+
+        return False
+
+    # --------------------------------------------------------
+    # Deadlock contradiction
+    # --------------------------------------------------------
+
+    if (
+        "no deadlock is detected" in context_lower
+        and (
+            "deadlock is detected" in answer_lower
+            or "there is a deadlock" in answer_lower
+            or "deadlock exists" in answer_lower
+        )
+    ):
+
+        return False
+
+    # --------------------------------------------------------
+    # Extract numbers from context and answer.
+    #
+    # The LLM should not introduce arbitrary numbers.
+    # --------------------------------------------------------
+
+    import re
+
+    context_numbers = re.findall(
+        r"(?<![A-Za-z])\d+(?![A-Za-z])",
+        context
     )
-    print("=" * 60)
 
-    # --------------------------------------------------------
-    # SYSTEM DATA
-    # --------------------------------------------------------
-
-    processes = [
-        "P0",
-        "P1",
-        "P2"
-    ]
-
-    resources = [
-        "CPU",
-        "Memory",
-        "GPU"
-    ]
-
-    maximum = [
-        [1, 1, 0],
-        [0, 1, 1],
-        [1, 0, 1]
-    ]
-
-    allocation = [
-        [1, 0, 0],
-        [0, 1, 0],
-        [0, 0, 1]
-    ]
-
-    # --------------------------------------------------------
-    # BUILD GRAPH
-    # --------------------------------------------------------
-
-    nodes, edges = build_resource_allocation_graph(
-        processes,
-        resources,
-        allocation,
-        maximum
+    answer_numbers = re.findall(
+        r"(?<![A-Za-z])\d+(?![A-Za-z])",
+        answer
     )
 
-    # --------------------------------------------------------
-    # LOAD LLM ONCE
-    # --------------------------------------------------------
+    allowed_numbers = set(
+        context_numbers
+    )
 
-    tokenizer, model, device = load_llm()
+    for number in answer_numbers:
 
-    # --------------------------------------------------------
-    # INTERACTIVE MODE
-    # --------------------------------------------------------
+        if number not in allowed_numbers:
+
+            return False
+
+    return True
+
+
+# ============================================================
+# INTERACTIVE ASSISTANT
+# ============================================================
+
+def run_assistant(allocator):
 
     print("\n" + "=" * 60)
-    print("INTERACTIVE MODE")
+    print("RAG + LLM INTERACTIVE ASSISTANT")
     print("=" * 60)
 
-    print(
-        "\nAsk questions about the resource allocation system."
-    )
+    print("""
+Ask questions about the CURRENT resource allocation state.
 
-    print(
-        "\nExamples:"
-    )
+Factual questions:
+- What resources does P3 hold?
+- What is P1's remaining need?
+- How many CPU resources are available?
+- How many GPU resources are available?
+- What resources are currently allocated?
+- What is P0's maximum need?
+- Show the allocation matrix.
+- Show the need matrix.
+- Show the maximum matrix.
 
-    print(
-        "- Why is the system deadlocked?"
-    )
+Safety and deadlock:
+- Is the system safe?
+- Why is the system safe?
+- Is there a deadlock?
+- Why is the system deadlocked?
+- Explain the circular wait.
 
-    print(
-        "- Why is P0 waiting?"
-    )
+LLM explanation:
+- Explain the current resource allocation situation.
+- Explain the current state in simple terms.
+- Explain Banker's Algorithm simply.
+- Explain resource allocation in simple terms.
+- What is a deadlock?
 
-    print(
-        "- What is P2 waiting for?"
-    )
+Hypothetical:
+- What would happen if P0 needed all of its remaining resources?
+- What if P1 requested all remaining resources?
 
-    print(
-        "- What resource does P1 hold?"
-    )
+Type 'exit' or 'quit' to return to the main menu.
+""")
 
-    print(
-        "- Which processes are causing the deadlock?"
-    )
+    print("-" * 60)
 
-    print(
-        "- Explain the circular wait."
-    )
+    # ========================================================
+    # CHECK LOCAL LLAMA SERVER
+    # ========================================================
 
-    print(
-        "\nType 'exit' or 'quit' to stop."
-    )
+    print("\nChecking local LLM server...\n")
 
-    # --------------------------------------------------------
+    try:
+
+        health_response = requests.get(
+            f"{LLAMA_SERVER_URL}/health",
+            timeout=5
+        )
+
+        if health_response.status_code == 200:
+
+            print(
+                "✓ llama-server is running."
+            )
+
+            print(
+                "✓ Local LLM: Llama-3.2-1B-Instruct"
+            )
+
+            print(
+                f"✓ Server: {LLAMA_SERVER_URL}"
+            )
+
+        else:
+
+            print(
+                "⚠ llama-server responded but is not healthy."
+            )
+
+    except Exception:
+
+        print(
+            "⚠ Could not connect to llama-server."
+        )
+
+        print(
+            f"  Expected server: {LLAMA_SERVER_URL}"
+        )
+
+        print(
+            "  LLM explanations may fail."
+        )
+
+    # ========================================================
     # QUESTION LOOP
-    # --------------------------------------------------------
+    # ========================================================
 
     while True:
 
-        print("\n" + "-" * 60)
+        try:
 
-        question = input(
-            "\nEnter your question: "
-        ).strip()
+            question = input(
+                "\nEnter your question: "
+            ).strip()
+
+        except (
+            KeyboardInterrupt,
+            EOFError
+        ):
+
+            print(
+                "\n\nReturning to main menu."
+            )
+
+            break
 
         if question.lower() in [
             "exit",
@@ -1177,70 +2109,54 @@ if __name__ == "__main__":
         ]:
 
             print(
-                "\nExiting RAG + LLM system."
+                "\nReturning to main menu."
             )
 
             break
 
         if not question:
 
-            print(
-                "\nPlease enter a question."
-            )
-
             continue
 
-        # ----------------------------------------------------
-        # RETRIEVE
-        # ----------------------------------------------------
+        # ====================================================
+        # RAG RETRIEVAL
+        # ====================================================
 
         print(
-            "\nRetrieving relevant graph information..."
+            "\nRetrieving relevant system information..."
         )
 
-        context_data = retrieve_graph_context(
+        context = generate_context(
             question,
-            nodes,
-            edges
-        )
-
-        context = format_context(
-            context_data
+            allocator
         )
 
         print(
             "\nRetrieved Context:"
         )
 
-        print(
-            "-" * 60
-        )
+        print("-" * 60)
 
         print(context)
 
-        # ----------------------------------------------------
-        # DETERMINE WHETHER QUESTION IS FACTUAL
-        # ----------------------------------------------------
+        # ====================================================
+        # FACTUAL ANSWER
+        # ====================================================
 
-        answer = deterministic_answer(
+        factual_answer = generate_factual_answer(
             question,
-            nodes,
-            edges,
-            processes
+            context,
+            allocator
         )
 
-        # ----------------------------------------------------
-        # DETERMINISTIC ANSWER
-        # ----------------------------------------------------
-
-        if answer is not None:
+        if factual_answer:
 
             print(
                 "\n" + "=" * 60
             )
 
             print(
-                "GRAPH-VERIFIED ANSWER"
+                "RAG FACTUAL ANSWER"
             )
 
             print(
@@ -1248,14 +2164,14 @@ if __name__ == "__main__":
             )
 
             print(
-                "\n" + answer
+                "\n" + factual_answer
             )
 
             continue
 
-        # ----------------------------------------------------
-        # LLM ANSWER
-        # ----------------------------------------------------
+        # ====================================================
+        # LLM FALLBACK
+        # ====================================================
 
         print(
             "\n" + "=" * 60
@@ -1269,13 +2185,56 @@ if __name__ == "__main__":
             "=" * 60
         )
 
-        answer = generate_llm_answer(
-            question,
+        try:
+
+            answer = generate_llm_answer(
+                question,
+                context
+            )
+
+        except Exception as e:
+
+            print(
+                "\nERROR: LLM generation failed."
+            )
+
+            print(
+                f"Details: {e}"
+            )
+
+            continue
+
+        # ====================================================
+        # VALIDATE OUTPUT
+        # ====================================================
+
+        valid = validate_llm_answer(
+            answer,
             context,
-            tokenizer,
-            model,
-            device
+            allocator
         )
+
+        if not valid:
+
+            print(
+                "\nWARNING: The LLM generated an "
+                "unsupported answer."
+            )
+
+            print(
+                "Returning a safer context-based response."
+            )
+
+            answer = (
+                "The retrieved system information is "
+                "authoritative, but the LLM response could "
+                "not be safely validated. Please ask a more "
+                "specific question about the current system."
+            )
+
+        # ====================================================
+        # DISPLAY
+        # ====================================================
 
         print(
             "\n" + "=" * 60
@@ -1292,4 +2251,23 @@ if __name__ == "__main__":
         print(
             "\n" + answer
         )
+
+
+# ============================================================
+# STANDALONE MODE
+# ============================================================
+
+if __name__ == "__main__":
+
+    print(
+        "\nThis file is designed to be launched through main.py."
+    )
+
+    print(
+        "Run:"
+    )
+
+    print(
+        "    python main.py"
+    )
 
